@@ -31,6 +31,42 @@ const AGENT = 'makefun-forge/1.0';
 const UPLOAD_CAPS_V0 = `side-band-64k shallow ofs-delta thin-pack multi_ack symref=HEAD:refs/heads/${DEFAULT_BRANCH} agent=${AGENT}`;
 const RECEIVE_CAPS_V0 = `report-status side-band-64k delete-refs ofs-delta symref=HEAD:refs/heads/${DEFAULT_BRANCH} agent=${AGENT}`;
 
+/**
+ * Response cache for the read-only git surfaces (info/refs, ls-refs, fetch).
+ * A fetch/ls-refs answer is a pure function of the repo's refs, its object
+ * count, and the request's arguments: objects are content-addressed and
+ * immutable, so any mutation that could change an answer (a ref move, or a
+ * new object) changes the key. No mutation site needs to know about the
+ * cache, and a stale entry is impossible by construction. Entries are
+ * bounded per repo (FIFO, 64 entries) so a long trial cannot grow memory.
+ */
+const responseCache = new WeakMap<Repo, Map<string, Buffer>>();
+const CACHE_MAX_ENTRIES = 64;
+
+function repoFingerprint(repo: Repo): string {
+  const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return `${refs.map(([n, o]) => `${n}=${o}`).join(',')}|objs=${repo.objects.size}`;
+}
+
+function cacheGet(repo: Repo, key: string): Buffer | undefined {
+  return responseCache.get(repo)?.get(key);
+}
+
+function cacheSet(repo: Repo, key: string, body: Buffer): void {
+  let perRepo = responseCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    responseCache.set(repo, perRepo);
+  }
+  if (perRepo.has(key)) perRepo.delete(key);
+  perRepo.set(key, body);
+  while (perRepo.size > CACHE_MAX_ENTRIES) {
+    const oldest = perRepo.keys().next();
+    if (oldest.done) break;
+    perRepo.delete(oldest.value);
+  }
+}
+
 /** Sorted refs as [name, oid] pairs, HEAD's target first when present. */
 function sortedRefs(repo: Repo): Array<[string, string]> {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
@@ -224,23 +260,48 @@ function selectFetchObjects(repo: Repo, wants: string[], haves: string[], deepen
   return { objects: ordered, shallow, unshallow, ack };
 }
 
+/** The v2 advertisement never mentions the repo, so one copy serves every request. */
+const V2_ADVERTISEMENT: Buffer = v2Advertisement();
+
 function handleInfoRefs(ctx: Ctx, repo: Repo, service: string): void {
   if (service === 'git-upload-pack') {
     if (ctx.headers['git-protocol'] === 'version=2') {
-      ctx.send(200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+      ctx.send(200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     } else {
-      ctx.send(200, v0UploadAdvertisement(repo), 'application/x-git-upload-pack-advertisement');
+      const key = `info-refs:upload-v0:${repoFingerprint(repo)}`;
+      const cached = cacheGet(repo, key);
+      if (cached) {
+        ctx.send(200, cached, 'application/x-git-upload-pack-advertisement');
+        return;
+      }
+      const body = v0UploadAdvertisement(repo);
+      cacheSet(repo, key, body);
+      ctx.send(200, body, 'application/x-git-upload-pack-advertisement');
     }
     return;
   }
   if (service === 'git-receive-pack') {
-    ctx.send(200, v0ReceiveAdvertisement(repo), 'application/x-git-receive-pack-advertisement');
+    const key = `info-refs:receive-v0:${repoFingerprint(repo)}`;
+    const cached = cacheGet(repo, key);
+    if (cached) {
+      ctx.send(200, cached, 'application/x-git-receive-pack-advertisement');
+      return;
+    }
+    const body = v0ReceiveAdvertisement(repo);
+    cacheSet(repo, key, body);
+    ctx.send(200, body, 'application/x-git-receive-pack-advertisement');
     return;
   }
   ctx.fail(400, `unknown service ${service}`);
 }
 
 function handleLsRefsV2(ctx: Ctx, repo: Repo, args: string[]): void {
+  const cacheKey = `ls-refs:${repoFingerprint(repo)}:${JSON.stringify(args)}`;
+  const cached = cacheGet(repo, cacheKey);
+  if (cached) {
+    ctx.send(200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
@@ -272,10 +333,18 @@ function handleLsRefsV2(ctx: Ctx, repo: Repo, args: string[]): void {
     lines.push(encodePktLine(`${line}\n`));
   }
   lines.push(PKT_FLUSH);
-  ctx.send(200, Buffer.concat(lines), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(lines);
+  cacheSet(repo, cacheKey, body);
+  ctx.send(200, body, 'application/x-git-upload-pack-result');
 }
 
 function handleFetchV2(ctx: Ctx, repo: Repo, args: string[]): void {
+  const cacheKey = `fetch:v2:${repoFingerprint(repo)}:${JSON.stringify(args)}`;
+  const cached = cacheGet(repo, cacheKey);
+  if (cached) {
+    ctx.send(200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const wants: string[] = [];
   const haves: string[] = [];
   const requestShallow: string[] = [];
@@ -309,7 +378,9 @@ function handleFetchV2(ctx: Ctx, repo: Repo, args: string[]): void {
     } else {
       parts.push(encodePktLine('NAK\n'));
       parts.push(PKT_FLUSH);
-      ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const body = Buffer.concat(parts);
+      cacheSet(repo, cacheKey, body);
+      ctx.send(200, body, 'application/x-git-upload-pack-result');
       return;
     }
   }
@@ -344,7 +415,9 @@ function handleFetchV2(ctx: Ctx, repo: Repo, args: string[]): void {
     parts.push(...sidebandPack(writePack(selection.objects)));
   }
   parts.push(PKT_FLUSH);
-  ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const fetchBody = Buffer.concat(parts);
+  cacheSet(repo, cacheKey, fetchBody);
+  ctx.send(200, fetchBody, 'application/x-git-upload-pack-result');
 }
 
 function handleUploadPackV2(ctx: Ctx, repo: Repo): void {
@@ -397,13 +470,21 @@ function handleUploadPackV0(ctx: Ctx, repo: Repo): void {
       if (Number.isInteger(n) && n > 0) deepen = n;
     }
   }
+  const cacheKey = `fetch:v0:${repoFingerprint(repo)}:${JSON.stringify([wants, haves, requestShallow, deepen])}`;
+  const cached = cacheGet(repo, cacheKey);
+  if (cached) {
+    ctx.send(200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const validWants = wants.filter((w) => isOid(w) && repo.objects.has(w));
   const selection = selectFetchObjects(repo, validWants, haves.filter(isOid), deepen, requestShallow);
   const parts: Buffer[] = [encodePktLine(selection.ack ? `ACK ${selection.ack}\n` : 'NAK\n')];
   for (const oid of selection.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
   if (selection.objects.length > 0) parts.push(...sidebandPack(writePack(selection.objects)));
   parts.push(PKT_FLUSH);
-  ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  cacheSet(repo, cacheKey, body);
+  ctx.send(200, body, 'application/x-git-upload-pack-result');
 }
 
 interface PushCommand {
