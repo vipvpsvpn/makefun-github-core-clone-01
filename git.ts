@@ -261,11 +261,15 @@ function handleLsRefsV2(ctx: Ctx, repo: Repo, args: string[]): void {
   }
   for (const [name, oid] of sortedRefs(repo)) {
     if (!include(name)) continue;
-    lines.push(encodePktLine(`${oid} ${name}\n`));
+    // One line per ref: the peeled target rides on the same line
+    // (`<oid> <name> peeled:<commit>`). A second plain line for the same
+    // ref makes a client's find() return the unpeeled entry.
+    let line = `${oid} ${name}`;
     if (peel) {
       const peeled = peelTag(repo, oid);
-      if (peeled) lines.push(encodePktLine(`${oid} ${name} peeled:${peeled}\n`));
+      if (peeled) line += ` peeled:${peeled}`;
     }
+    lines.push(encodePktLine(`${line}\n`));
   }
   lines.push(PKT_FLUSH);
   ctx.send(200, Buffer.concat(lines), 'application/x-git-upload-pack-result');

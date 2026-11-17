@@ -100,10 +100,13 @@ function commitJson(repo: Repo, sha: string, epoch: number): Record<string, unkn
   const author = parseIdent(commit.author);
   const committer = parseIdent(commit.committer);
   const date = new Date(epoch * 1000).toISOString();
+  // GitHub's API returns the message without the commit object's trailing
+  // newline; the checks compare it exactly, so strip trailing newlines.
+  const message = commit.message.replace(/[\r\n]+$/, '');
   return {
     sha,
     commit: {
-      message: commit.message,
+      message,
       author: { name: author.name, email: author.email, date },
       committer: { name: committer.name, email: committer.email, date },
     },

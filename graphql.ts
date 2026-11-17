@@ -459,6 +459,11 @@ const TYPE_INFO: Record<string, { kind: string; fields?: string[]; enumValues?: 
   PullRequestConnection: { kind: 'OBJECT', fields: ['nodes', 'pageInfo', 'totalCount'] },
   PullRequestChangedFile: { kind: 'OBJECT', fields: ['path'] },
   PullRequestChangedFileConnection: { kind: 'OBJECT', fields: ['nodes', 'pageInfo', 'totalCount'] },
+  CreateIssuePayload: { kind: 'OBJECT', fields: ['issue'] },
+  CloseIssuePayload: { kind: 'OBJECT', fields: ['issue'] },
+  CreatePullRequestPayload: { kind: 'OBJECT', fields: ['pullRequest'] },
+  MergePullRequestPayload: { kind: 'OBJECT', fields: ['pullRequest'] },
+  AddCommentPayload: { kind: 'OBJECT', fields: ['commentEdge'] },
   User: { kind: 'OBJECT', fields: ['login', 'id'] },
   Ref: { kind: 'OBJECT', fields: ['name'] },
   Node: { kind: 'INTERFACE', fields: ['id'] },
@@ -690,6 +695,21 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
   },
   PullRequestChangedFile: {
     path: (node) => node.path as string,
+  },
+  CreateIssuePayload: {
+    issue: (node) => node.issue as AnyNode,
+  },
+  CloseIssuePayload: {
+    issue: (node) => node.issue as AnyNode,
+  },
+  CreatePullRequestPayload: {
+    pullRequest: (node) => node.pullRequest as AnyNode,
+  },
+  MergePullRequestPayload: {
+    pullRequest: (node) => node.pullRequest as AnyNode,
+  },
+  AddCommentPayload: {
+    commentEdge: (node) => node.commentEdge as AnyNode,
   },
   User: {
     login: (node) => node.login as string,
